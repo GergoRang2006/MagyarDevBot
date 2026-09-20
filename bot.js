@@ -32,6 +32,11 @@ const DEVLOG_CHANNEL_ID = process.env.DEVLOG_CHANNEL_ID || '1551149810797641859'
 const WELCOME_CHANNEL_ID = process.env.WELCOME_CHANNEL_ID || '1549459709587890258';
 // Opcionális: a saját Discord felhasználói ID-d. A /clear-t a szerver tulajdonosa és ez az ID használhatja.
 const OWNER_ID = process.env.OWNER_ID || '';
+// A /post-hoz ez a rang kell. Ha a VERIFIED_ROLE_ID üres, a "Verified" nevű rangot keresi (kis/nagybetű mindegy).
+const VERIFIED_ROLE_ID = process.env.VERIFIED_ROLE_ID || '';
+const VERIFIED_ROLE_NAME = 'verified';
+// Ezt a nevet írja ki a bot a kirúgott/kitiltott tagoknak, ha fellebbezni szeretnének
+const APPEAL_CONTACT = 'Gerytwt';
 
 // ---------- Kinézet ----------
 const EMBED_COLOR = 0xFF0000; // az embed bal oldali sávjának színe (piros)
@@ -386,6 +391,19 @@ client.once(Events.ClientReady, async () => {
             .setDefaultMemberPermissions(PermissionFlagsBits.KickMembers)
             .addUserOption(o => o.setName('user').setDescription('Kit rúgsz ki?').setRequired(true))
             .addStringOption(o => o.setName('reason').setDescription('Miért rúgod ki?').setRequired(true).setMaxLength(400))
+            .toJSON(),
+        new SlashCommandBuilder()
+            .setName('mute')
+            .setDescription('Tag némítása (nem tud írni, beszélni, reagálni)')
+            .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers)
+            .addUserOption(o => o.setName('user').setDescription('Kit némítasz?').setRequired(true))
+            .addStringOption(o => o.setName('reason').setDescription('Miért némítod?').setRequired(true).setMaxLength(400))
+            .addIntegerOption(o => o
+                .setName('minutes')
+                .setDescription('Hány percre? (max. 40320 = 28 nap)')
+                .setRequired(true)
+                .setMinValue(1)
+                .setMaxValue(28 * 24 * 60))
             .toJSON()
     ];
 
@@ -565,6 +583,22 @@ function markRemoval(userId) {
     setTimeout(() => recentRemovals.delete(userId), 15000);
 }
 
+// Ha a DM nem ment át, a moderátor ezt látja a válaszban
+const dmNote = sent => (sent ? '' : '\n⚠️ A privát üzenetet nem tudtam elküldeni neki (valószínűleg le van tiltva a DM).');
+const APPEAL_TEXT = `Ha szerinted tévedés történt, vagy fellebbezni szeretnél, add hozzá Discordon: **${APPEAL_CONTACT}**`;
+
+function isVerified(interaction) {
+    const roles = interaction.member?.roles?.cache;
+    if (!roles) return false;
+    return roles.some(r => (VERIFIED_ROLE_ID ? r.id === VERIFIED_ROLE_ID : r.name.toLowerCase() === VERIFIED_ROLE_NAME));
+}
+
+function formatMinutes(m) {
+    if (m % 1440 === 0) return `${m / 1440} nap`;
+    if (m % 60 === 0) return `${m / 60} óra`;
+    return `${m} perc`;
+}
+
 async function tryDm(user, embed) {
     try {
         await user.send({ embeds: [embed] });
@@ -699,15 +733,22 @@ async function handleBanCommand(interaction) {
     const durationText = isTemp ? `${hours} óra` : 'Végleges';
 
     // A DM-et a ban ELŐTT kell elküldeni, utána már nem érhető el a tag
+    let dmSent = true;
     if (member) {
         const dmEmbed = new EmbedBuilder()
             .setColor(EMBED_COLOR)
             .setTitle(`Ki lettél tiltva a(z) ${guild.name} szerverről`)
+            .setDescription(
+                isTemp
+                    ? `Ideiglenesen kitiltottak a(z) **${guild.name}** szerverről.`
+                    : `Véglegesen kitiltottak a(z) **${guild.name}** szerverről.`
+            )
             .addFields(
                 { name: 'Indok', value: shorten(reason) },
-                { name: 'Időtartam', value: isTemp ? `${hours} óra (lejár: <t:${unix(unbanAt)}:F>)` : 'Végleges' }
+                { name: 'Időtartam', value: isTemp ? `${hours} óra (lejár: <t:${unix(unbanAt)}:F>)` : 'Végleges' },
+                { name: 'Fellebbezés', value: APPEAL_TEXT }
             );
-        await tryDm(target, dmEmbed);
+        dmSent = await tryDm(target, dmEmbed);
     }
 
     markRemoval(target.id);
@@ -740,7 +781,7 @@ async function handleBanCommand(interaction) {
     embed.addFields({ name: 'Indok', value: shorten(reason) });
     await sendDevlog(embed);
 
-    await interaction.editReply({ content: `✅ **${target.tag}** kitiltva (${durationText}).` });
+    await interaction.editReply({ content: `✅ **${target.tag}** kitiltva (${durationText}).${dmNote(dmSent)}` });
 }
 
 async function handleKickCommand(interaction) {
@@ -777,12 +818,16 @@ async function handleKickCommand(interaction) {
     }
 
     // A DM-et a kick ELŐTT kell elküldeni
-    await tryDm(
+    const dmSent = await tryDm(
         target,
         new EmbedBuilder()
             .setColor(LOG_COLORS.kick)
             .setTitle(`Ki lettél rúgva a(z) ${guild.name} szerverről`)
-            .addFields({ name: 'Indok', value: shorten(reason) })
+            .setDescription(`Kirúgtak a(z) **${guild.name}** szerverről. Újra csatlakozhatsz, de viselkedj a szabályok szerint.`)
+            .addFields(
+                { name: 'Indok', value: shorten(reason) },
+                { name: 'Fellebbezés', value: APPEAL_TEXT }
+            )
     );
 
     markRemoval(target.id);
@@ -806,7 +851,68 @@ async function handleKickCommand(interaction) {
             )
     );
 
-    await interaction.editReply({ content: `✅ **${target.tag}** kirúgva.` });
+    await interaction.editReply({ content: `✅ **${target.tag}** kirúgva.${dmNote(dmSent)}` });
+}
+
+async function handleMuteCommand(interaction) {
+    if (!interaction.inGuild() || !interaction.guild) {
+        await interaction.reply({ content: 'Ez a parancs csak szerveren használható.', flags: MessageFlags.Ephemeral });
+        return;
+    }
+    if (!interaction.memberPermissions?.has(PermissionFlagsBits.ModerateMembers)) {
+        await interaction.reply({ content: 'Ehhez a parancshoz **Moderate Members** jog kell.', flags: MessageFlags.Ephemeral });
+        return;
+    }
+
+    const guild = interaction.guild;
+    const target = interaction.options.getUser('user', true);
+    const reason = interaction.options.getString('reason', true).trim();
+    const minutes = interaction.options.getInteger('minutes', true);
+
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    const fail = text => interaction.editReply({ content: `❌ ${text}` });
+
+    const member = await guild.members.fetch(target.id).catch(() => null);
+    if (!member) {
+        await fail('Ő nincs a szerveren.');
+        return;
+    }
+
+    const problem = checkModerable(interaction, target, member);
+    if (problem) {
+        await fail(problem);
+        return;
+    }
+    if (!member.moderatable) {
+        await fail('A bot nem tudja némítani (adminisztrátor, a botnál magasabb rangú, vagy hiányzik a Moderate Members jog).');
+        return;
+    }
+
+    const until = Date.now() + minutes * 60 * 1000;
+    const durationText = formatMinutes(minutes);
+    try {
+        await member.timeout(minutes * 60 * 1000, shorten(`${reason} | Mod: ${interaction.user.tag} | ${durationText}`, 500));
+    } catch (error) {
+        console.error('Mute hiba:', error);
+        await fail('Nem sikerült némítani, nézd meg a bot jogosultságait.');
+        return;
+    }
+
+    await sendDevlog(
+        new EmbedBuilder()
+            .setColor(LOG_COLORS.timeout)
+            .setTitle('🔇 Mute')
+            .setThumbnail(target.displayAvatarURL())
+            .addFields(
+                { name: 'Felhasználó', value: userLine(target.id), inline: true },
+                { name: 'Moderátor', value: userLine(interaction.user.id), inline: true },
+                { name: 'Időtartam', value: durationText, inline: true },
+                { name: 'Lejár', value: fullTime(until) },
+                { name: 'Indok', value: shorten(reason) }
+            )
+    );
+
+    await interaction.editReply({ content: `✅ **${target.tag}** némítva (${durationText}).` });
 }
 
 // ---------- Devlog: amit a modok kézzel csinálnak (Discord felületről) ----------
@@ -1538,13 +1644,22 @@ client.on(Events.InteractionCreate, async interaction => {
     try {
         if (interaction.isChatInputCommand()) {
             if (interaction.commandName === 'post') {
-                await interaction.reply({ ...renderMainMenu(), flags: MessageFlags.Ephemeral });
+                if (!isVerified(interaction)) {
+                    await interaction.reply({
+                        content: 'A `/post` használatához **Verified** rang kell.',
+                        flags: MessageFlags.Ephemeral
+                    });
+                } else {
+                    await interaction.reply({ ...renderMainMenu(), flags: MessageFlags.Ephemeral });
+                }
             } else if (interaction.commandName === 'clear') {
                 await handleClearCommand(interaction);
             } else if (interaction.commandName === 'ban') {
                 await handleBanCommand(interaction);
             } else if (interaction.commandName === 'kick') {
                 await handleKickCommand(interaction);
+            } else if (interaction.commandName === 'mute') {
+                await handleMuteCommand(interaction);
             }
         } else if (interaction.isButton()) {
             await handleButton(interaction);
