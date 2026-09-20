@@ -15,7 +15,8 @@ const {
     StringSelectMenuBuilder,
     StringSelectMenuOptionBuilder,
     PermissionFlagsBits,
-    MessageFlags
+    MessageFlags,
+    AuditLogEvent
 } = require('discord.js');
 
 // ---------- Beállítások ----------
@@ -25,6 +26,12 @@ const TOKEN = process.env.DISCORD_TOKEN;
 const ADMIN_CHANNEL_ID = process.env.ADMIN_CHANNEL_ID || '1550573376693866526'; // ide mennek a review-ra váró posztok
 // Ide mennek a jelentett posztok (admin report szoba).
 const REPORT_CHANNEL_ID = process.env.REPORT_CHANNEL_ID || '1550988586998825090';
+// Devlog szoba: ide kerül minden napló (belépések, ban, kick, timeout, törölt üzenetek stb.)
+const DEVLOG_CHANNEL_ID = process.env.DEVLOG_CHANNEL_ID || '1551149810797641859';
+// Üdvözlő szoba: ide köszönti a bot az új tagokat
+const WELCOME_CHANNEL_ID = process.env.WELCOME_CHANNEL_ID || '1549459709587890258';
+// Opcionális: a saját Discord felhasználói ID-d. A /clear-t a szerver tulajdonosa és ez az ID használhatja.
+const OWNER_ID = process.env.OWNER_ID || '';
 
 // ---------- Kinézet ----------
 const EMBED_COLOR = 0xFF0000; // az embed bal oldali sávjának színe (piros)
@@ -136,7 +143,10 @@ const client = new Client({
     intents: [
         GatewayIntentBits.Guilds,
         GatewayIntentBits.GuildMessages,
-        GatewayIntentBits.MessageContent
+        GatewayIntentBits.MessageContent,
+        // FIGYELEM: a Server Members Intent-et is be kell kapcsolni a Developer Portalon (belépő/kilépő tagokhoz)
+        GatewayIntentBits.GuildMembers,
+        GatewayIntentBits.GuildModeration // audit log események (ban/kick/timeout naplózás)
     ]
 });
 
@@ -347,8 +357,35 @@ client.once(Events.ClientReady, async () => {
             .toJSON(),
         new SlashCommandBuilder()
             .setName('clear')
-            .setDescription('A csatorna ÖSSZES üzenetének törlése (csak tulajdonos/admin)')
+            .setDescription('A csatorna ÖSSZES üzenetének törlése (csak a tulajdonos)')
             .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+            .toJSON(),
+        new SlashCommandBuilder()
+            .setName('ban')
+            .setDescription('Tag kitiltása (ideiglenes vagy végleges)')
+            .setDefaultMemberPermissions(PermissionFlagsBits.BanMembers)
+            .addUserOption(o => o.setName('user').setDescription('Kit tiltasz ki?').setRequired(true))
+            .addStringOption(o => o.setName('reason').setDescription('Miért tiltod ki?').setRequired(true).setMaxLength(400))
+            .addStringOption(o => o
+                .setName('type')
+                .setDescription('Ideiglenes vagy végleges tiltás')
+                .setRequired(true)
+                .addChoices(
+                    { name: 'Ideiglenes (temp)', value: 'temp' },
+                    { name: 'Végleges (perma)', value: 'perma' }
+                ))
+            .addIntegerOption(o => o
+                .setName('hours')
+                .setDescription('Hány órára? (csak ideiglenes tiltásnál kell)')
+                .setMinValue(1)
+                .setMaxValue(24 * 365))
+            .toJSON(),
+        new SlashCommandBuilder()
+            .setName('kick')
+            .setDescription('Tag kirúgása a szerverről')
+            .setDefaultMemberPermissions(PermissionFlagsBits.KickMembers)
+            .addUserOption(o => o.setName('user').setDescription('Kit rúgsz ki?').setRequired(true))
+            .addStringOption(o => o.setName('reason').setDescription('Miért rúgod ki?').setRequired(true).setMaxLength(400))
             .toJSON()
     ];
 
@@ -359,6 +396,10 @@ client.once(Events.ClientReady, async () => {
     } catch (error) {
         console.error('Parancs regisztrálási hiba:', error);
     }
+
+    // Lejárt ideiglenes tiltások feloldása (induláskor, majd percenként)
+    processTempBans().catch(e => console.error('Tempban hiba:', e));
+    setInterval(() => processTempBans().catch(e => console.error('Tempban hiba:', e)), 60 * 1000);
 });
 
 // ---------- Csillag reakció a képekre ----------
@@ -401,7 +442,7 @@ function canClear(interaction) {
     return Boolean(
         interaction.guild &&
         (interaction.guild.ownerId === interaction.user.id ||
-            interaction.memberPermissions?.has(PermissionFlagsBits.Administrator))
+            (OWNER_ID && interaction.user.id === OWNER_ID))
     );
 }
 
@@ -450,7 +491,7 @@ async function handleClearCommand(interaction) {
 
     if (!canClear(interaction)) {
         await interaction.reply({
-            content: 'Ehhez a parancshoz szerver tulajdonosi vagy adminisztrátori jog kell.',
+            content: 'Ezt a parancsot csak a szerver tulajdonosa használhatja.',
             flags: MessageFlags.Ephemeral
         });
         return;
@@ -488,6 +529,468 @@ async function handleClearCommand(interaction) {
         flags: MessageFlags.Ephemeral
     });
 }
+
+// ---------- Moderáció: devlog, /ban, /kick, üdvözlő ----------
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+const unix = ms => Math.floor(ms / 1000);
+const fullTime = ms => `<t:${unix(ms)}:F> (<t:${unix(ms)}:R>)`;
+const userLine = id => (id ? `<@${id}> (\`${id}\`)` : '*Ismeretlen*');
+const shorten = (text, max = 1000) => (text.length > max ? text.slice(0, max - 1) + '…' : text);
+
+// A devlog embedek oldalsávjának színei
+const LOG_COLORS = {
+    ban: EMBED_COLOR,
+    kick: 0xE67E22,
+    join: 0x57F287,
+    leave: 0x95A5A6,
+    unban: 0x57F287,
+    timeout: 0xFEE75C,
+    message: 0x5865F2
+};
+
+// Minden naplóbejegyzés ezen megy át: egy kis embed a devlog szobába
+async function sendDevlog(embed) {
+    try {
+        const channel = await client.channels.fetch(DEVLOG_CHANNEL_ID);
+        await channel.send({ embeds: [embed.setTimestamp()], allowedMentions: { parse: [] } });
+    } catch (error) {
+        console.error('Devlog hiba:', error.message);
+    }
+}
+
+// Ban/kick után a tag "kilépését" nem naplózzuk külön (különben dupla lenne a log)
+const recentRemovals = new Set();
+function markRemoval(userId) {
+    recentRemovals.add(userId);
+    setTimeout(() => recentRemovals.delete(userId), 15000);
+}
+
+async function tryDm(user, embed) {
+    try {
+        await user.send({ embeds: [embed] });
+        return true;
+    } catch {
+        return false; // le van tiltva a DM
+    }
+}
+
+// ---------- Ideiglenes tiltások (fájlban tárolva, újraindítás után is megmaradnak) ----------
+const TEMPBAN_FILE = path.join(__dirname, 'tempbans.json');
+let tempBans = [];
+try {
+    tempBans = JSON.parse(fs.readFileSync(TEMPBAN_FILE, 'utf8'));
+    if (!Array.isArray(tempBans)) tempBans = [];
+} catch {
+    tempBans = [];
+}
+
+function saveTempBans() {
+    try {
+        fs.writeFileSync(TEMPBAN_FILE, JSON.stringify(tempBans, null, 2));
+    } catch (error) {
+        console.error('A tempbans.json nem menthető:', error.message);
+    }
+}
+
+function removeTempBan(guildId, userId) {
+    const before = tempBans.length;
+    tempBans = tempBans.filter(b => !(b.guildId === guildId && b.userId === userId));
+    if (tempBans.length !== before) saveTempBans();
+}
+
+let processingTempBans = false;
+async function processTempBans() {
+    if (processingTempBans) return;
+    processingTempBans = true;
+    try {
+        const due = tempBans.filter(b => b.unbanAt <= Date.now());
+        for (const ban of due) {
+            try {
+                const guild = await client.guilds.fetch(ban.guildId);
+                await guild.members.unban(ban.userId, 'Lejárt az ideiglenes tiltás');
+            } catch (error) {
+                // 10026 = már nincs kitiltva, 10004 = a szerver már nem elérhető -> töröljük a bejegyzést
+                if (error.code !== 10026 && error.code !== 10004) {
+                    console.error('Automatikus unban hiba:', error.message);
+                    continue; // legközelebb újra próbáljuk
+                }
+            }
+
+            tempBans = tempBans.filter(b => b !== ban);
+            saveTempBans();
+
+            await sendDevlog(
+                new EmbedBuilder()
+                    .setColor(LOG_COLORS.unban)
+                    .setTitle('⏰ Ideiglenes tiltás lejárt')
+                    .addFields(
+                        { name: 'Felhasználó', value: userLine(ban.userId) },
+                        { name: 'Feloldva', value: 'Automatikusan (lejárt az idő)' }
+                    )
+            );
+        }
+    } finally {
+        processingTempBans = false;
+    }
+}
+
+// ---------- /ban és /kick ----------
+// Közös ellenőrzés: magát, a botot, a tulajdonost és a nála magasabb rangút nem lehet.
+function checkModerable(interaction, target, member) {
+    const guild = interaction.guild;
+    if (target.id === interaction.user.id) return 'Magadat nem teheted meg.';
+    if (target.id === client.user.id) return 'A botot nem tudod.';
+    if (target.id === guild.ownerId) return 'A szerver tulajdonosát nem lehet.';
+
+    const modTop = interaction.member?.roles?.highest;
+    if (member && modTop && interaction.user.id !== guild.ownerId &&
+        modTop.comparePositionTo(member.roles.highest) <= 0) {
+        return 'Ő ugyanolyan vagy magasabb rangú, mint te.';
+    }
+    return null;
+}
+
+async function handleBanCommand(interaction) {
+    if (!interaction.inGuild() || !interaction.guild) {
+        await interaction.reply({ content: 'Ez a parancs csak szerveren használható.', flags: MessageFlags.Ephemeral });
+        return;
+    }
+    if (!interaction.memberPermissions?.has(PermissionFlagsBits.BanMembers)) {
+        await interaction.reply({ content: 'Ehhez a parancshoz **Ban Members** jog kell.', flags: MessageFlags.Ephemeral });
+        return;
+    }
+
+    const guild = interaction.guild;
+    const target = interaction.options.getUser('user', true);
+    const reason = interaction.options.getString('reason', true).trim();
+    const type = interaction.options.getString('type', true); // 'temp' | 'perma'
+    const hours = interaction.options.getInteger('hours');
+
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    const fail = text => interaction.editReply({ content: `❌ ${text}` });
+
+    if (type === 'temp' && !hours) {
+        await fail('Ideiglenes tiltásnál add meg, hány órára szól (`hours`).');
+        return;
+    }
+    if (type === 'perma' && hours) {
+        await fail('Végleges tiltásnál ne adj meg órát (`hours`).');
+        return;
+    }
+
+    if (await guild.bans.fetch(target.id).catch(() => null)) {
+        await fail('Ő már ki van tiltva.');
+        return;
+    }
+
+    const member = await guild.members.fetch(target.id).catch(() => null);
+    const problem = checkModerable(interaction, target, member);
+    if (problem) {
+        await fail(problem);
+        return;
+    }
+    if (member && !member.bannable) {
+        await fail('A bot nem tudja kitiltani (a botnál magasabb rangú, vagy hiányzik a Ban Members jog).');
+        return;
+    }
+
+    const isTemp = type === 'temp';
+    const unbanAt = isTemp ? Date.now() + hours * 60 * 60 * 1000 : null;
+    const durationText = isTemp ? `${hours} óra` : 'Végleges';
+
+    // A DM-et a ban ELŐTT kell elküldeni, utána már nem érhető el a tag
+    if (member) {
+        const dmEmbed = new EmbedBuilder()
+            .setColor(EMBED_COLOR)
+            .setTitle(`Ki lettél tiltva a(z) ${guild.name} szerverről`)
+            .addFields(
+                { name: 'Indok', value: shorten(reason) },
+                { name: 'Időtartam', value: isTemp ? `${hours} óra (lejár: <t:${unix(unbanAt)}:F>)` : 'Végleges' }
+            );
+        await tryDm(target, dmEmbed);
+    }
+
+    markRemoval(target.id);
+    try {
+        await guild.members.ban(target.id, {
+            reason: shorten(`${reason} | Mod: ${interaction.user.tag} | ${durationText}`, 500)
+        });
+    } catch (error) {
+        console.error('Ban hiba:', error);
+        await fail('Nem sikerült kitiltani, nézd meg a bot jogosultságait.');
+        return;
+    }
+
+    removeTempBan(guild.id, target.id);
+    if (isTemp) {
+        tempBans.push({ guildId: guild.id, userId: target.id, unbanAt });
+        saveTempBans();
+    }
+
+    const embed = new EmbedBuilder()
+        .setColor(LOG_COLORS.ban)
+        .setTitle(isTemp ? '🔨 Ideiglenes tiltás' : '🔨 Végleges tiltás')
+        .setThumbnail(target.displayAvatarURL())
+        .addFields(
+            { name: 'Felhasználó', value: userLine(target.id), inline: true },
+            { name: 'Moderátor', value: userLine(interaction.user.id), inline: true },
+            { name: 'Időtartam', value: durationText, inline: true }
+        );
+    if (isTemp) embed.addFields({ name: 'Lejár', value: fullTime(unbanAt) });
+    embed.addFields({ name: 'Indok', value: shorten(reason) });
+    await sendDevlog(embed);
+
+    await interaction.editReply({ content: `✅ **${target.tag}** kitiltva (${durationText}).` });
+}
+
+async function handleKickCommand(interaction) {
+    if (!interaction.inGuild() || !interaction.guild) {
+        await interaction.reply({ content: 'Ez a parancs csak szerveren használható.', flags: MessageFlags.Ephemeral });
+        return;
+    }
+    if (!interaction.memberPermissions?.has(PermissionFlagsBits.KickMembers)) {
+        await interaction.reply({ content: 'Ehhez a parancshoz **Kick Members** jog kell.', flags: MessageFlags.Ephemeral });
+        return;
+    }
+
+    const guild = interaction.guild;
+    const target = interaction.options.getUser('user', true);
+    const reason = interaction.options.getString('reason', true).trim();
+
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    const fail = text => interaction.editReply({ content: `❌ ${text}` });
+
+    const member = await guild.members.fetch(target.id).catch(() => null);
+    if (!member) {
+        await fail('Ő nincs a szerveren.');
+        return;
+    }
+
+    const problem = checkModerable(interaction, target, member);
+    if (problem) {
+        await fail(problem);
+        return;
+    }
+    if (!member.kickable) {
+        await fail('A bot nem tudja kirúgni (a botnál magasabb rangú, vagy hiányzik a Kick Members jog).');
+        return;
+    }
+
+    // A DM-et a kick ELŐTT kell elküldeni
+    await tryDm(
+        target,
+        new EmbedBuilder()
+            .setColor(LOG_COLORS.kick)
+            .setTitle(`Ki lettél rúgva a(z) ${guild.name} szerverről`)
+            .addFields({ name: 'Indok', value: shorten(reason) })
+    );
+
+    markRemoval(target.id);
+    try {
+        await member.kick(shorten(`${reason} | Mod: ${interaction.user.tag}`, 500));
+    } catch (error) {
+        console.error('Kick hiba:', error);
+        await fail('Nem sikerült kirúgni, nézd meg a bot jogosultságait.');
+        return;
+    }
+
+    await sendDevlog(
+        new EmbedBuilder()
+            .setColor(LOG_COLORS.kick)
+            .setTitle('👢 Kick')
+            .setThumbnail(target.displayAvatarURL())
+            .addFields(
+                { name: 'Felhasználó', value: userLine(target.id), inline: true },
+                { name: 'Moderátor', value: userLine(interaction.user.id), inline: true },
+                { name: 'Indok', value: shorten(reason) }
+            )
+    );
+
+    await interaction.editReply({ content: `✅ **${target.tag}** kirúgva.` });
+}
+
+// ---------- Devlog: amit a modok kézzel csinálnak (Discord felületről) ----------
+// A Discord audit log eseményeiből dolgozik. A bot saját műveleteit (/ban, /kick) kihagyja,
+// mert azokat a parancs már naplózta.
+client.on(Events.GuildAuditLogEntryCreate, async (entry, guild) => {
+    try {
+        const { action, executorId, targetId } = entry;
+
+        if (action === AuditLogEvent.MemberKick || action === AuditLogEvent.MemberBanAdd) {
+            markRemoval(targetId);
+        }
+        if (executorId === client.user.id) return;
+
+        const reason = entry.reason ? shorten(entry.reason) : '*Nincs megadva*';
+
+        if (action === AuditLogEvent.MemberKick) {
+            await sendDevlog(
+                new EmbedBuilder()
+                    .setColor(LOG_COLORS.kick)
+                    .setTitle('👢 Kick')
+                    .addFields(
+                        { name: 'Felhasználó', value: userLine(targetId), inline: true },
+                        { name: 'Moderátor', value: userLine(executorId), inline: true },
+                        { name: 'Indok', value: reason }
+                    )
+            );
+        } else if (action === AuditLogEvent.MemberBanAdd) {
+            await sendDevlog(
+                new EmbedBuilder()
+                    .setColor(LOG_COLORS.ban)
+                    .setTitle('🔨 Tiltás (kézzel)')
+                    .addFields(
+                        { name: 'Felhasználó', value: userLine(targetId), inline: true },
+                        { name: 'Moderátor', value: userLine(executorId), inline: true },
+                        { name: 'Indok', value: reason }
+                    )
+            );
+        } else if (action === AuditLogEvent.MemberBanRemove) {
+            removeTempBan(guild.id, targetId); // ha kézzel oldották fel, az időzítő ne foglalkozzon vele
+            await sendDevlog(
+                new EmbedBuilder()
+                    .setColor(LOG_COLORS.unban)
+                    .setTitle('✅ Tiltás feloldva')
+                    .addFields(
+                        { name: 'Felhasználó', value: userLine(targetId), inline: true },
+                        { name: 'Moderátor', value: userLine(executorId), inline: true },
+                        { name: 'Indok', value: reason }
+                    )
+            );
+        } else if (action === AuditLogEvent.MemberUpdate) {
+            const change = entry.changes?.find(c => c.key === 'communication_disabled_until');
+            if (!change) return;
+
+            const until = change.new ? new Date(change.new).getTime() : null;
+            const active = until && until > Date.now();
+
+            const embed = new EmbedBuilder()
+                .setColor(LOG_COLORS.timeout)
+                .setTitle(active ? '🔇 Timeout' : '🔊 Timeout levéve')
+                .addFields(
+                    { name: 'Felhasználó', value: userLine(targetId), inline: true },
+                    { name: 'Moderátor', value: userLine(executorId), inline: true }
+                );
+            if (active) embed.addFields({ name: 'Lejár', value: fullTime(until) });
+            embed.addFields({ name: 'Indok', value: reason });
+            await sendDevlog(embed);
+        }
+    } catch (error) {
+        console.error('Audit log hiba:', error);
+    }
+});
+
+// ---------- Belépő tagok: üdvözlő + devlog ----------
+client.on(Events.GuildMemberAdd, async member => {
+    // Üdvözlő üzenet (botokat nem üdvözlünk)
+    if (!member.user.bot) {
+        try {
+            const channel = await client.channels.fetch(WELCOME_CHANNEL_ID);
+            const welcome = new EmbedBuilder()
+                .setColor(EMBED_COLOR)
+                .setTitle(`Üdv a szerveren, ${member.displayName}! 👋`)
+                .setDescription(
+                    `Örülünk, hogy csatlakoztál, ${member}!\n` +
+                    `Te vagy a(z) **${member.guild.memberCount}.** tagunk.` + WIDE_PAD
+                )
+                .setThumbnail(member.user.displayAvatarURL())
+                .setFooter({ text: member.guild.name });
+
+            await channel.send({
+                content: `${member}`,
+                embeds: [welcome],
+                allowedMentions: { users: [member.id] }
+            });
+        } catch (error) {
+            console.error('Üdvözlő hiba:', error.message);
+        }
+    }
+
+    // Devlog
+    const created = member.user.createdTimestamp;
+    const isNewAccount = Date.now() - created < 7 * 24 * 60 * 60 * 1000;
+    const embed = new EmbedBuilder()
+        .setColor(LOG_COLORS.join)
+        .setTitle(member.user.bot ? '🤖 Bot csatlakozott' : '📥 Új tag csatlakozott')
+        .setThumbnail(member.user.displayAvatarURL())
+        .addFields(
+            { name: 'Felhasználó', value: userLine(member.id), inline: true },
+            { name: 'Tagok száma', value: String(member.guild.memberCount), inline: true },
+            {
+                name: 'Fiók létrehozva',
+                value: fullTime(created) + (isNewAccount ? '\n⚠️ **Új fiók (7 napnál fiatalabb)**' : '')
+            }
+        );
+    await sendDevlog(embed);
+});
+
+// ---------- Kilépő tagok (kick/ban esetén nem naplózzuk külön) ----------
+client.on(Events.GuildMemberRemove, async member => {
+    try {
+        await sleep(2500); // várunk, hogy az audit log esemény (kick/ban) is megérkezzen
+        if (recentRemovals.has(member.id)) return;
+
+        const embed = new EmbedBuilder()
+            .setColor(LOG_COLORS.leave)
+            .setTitle('📤 Tag kilépett')
+            .setThumbnail(member.user.displayAvatarURL())
+            .addFields(
+                { name: 'Felhasználó', value: userLine(member.id), inline: true },
+                { name: 'Tagok száma', value: String(member.guild.memberCount), inline: true }
+            );
+        if (member.joinedTimestamp) embed.addFields({ name: 'Csatlakozott', value: fullTime(member.joinedTimestamp) });
+        await sendDevlog(embed);
+    } catch (error) {
+        console.error('Kilépés log hiba:', error);
+    }
+});
+
+// ---------- Üzenetek törlése / szerkesztése ----------
+// Csak azokat látja a bot, amik már a memóriájában voltak (újraindítás előtti üzeneteket nem).
+client.on(Events.MessageDelete, async message => {
+    try {
+        if (!message.guild || message.author?.bot) return;
+        if (message.channelId === DEVLOG_CHANNEL_ID || clearing.has(message.channelId)) return;
+
+        const embed = new EmbedBuilder()
+            .setColor(LOG_COLORS.message)
+            .setTitle('🗑️ Üzenet törölve')
+            .addFields(
+                { name: 'Szerző', value: userLine(message.author?.id), inline: true },
+                { name: 'Csatorna', value: `<#${message.channelId}>`, inline: true },
+                { name: 'Tartalom', value: shorten(message.content || '*(nincs szöveg)*') }
+            );
+        if (message.attachments?.size) {
+            embed.addFields({ name: 'Mellékletek', value: `${message.attachments.size} db` });
+        }
+        await sendDevlog(embed);
+    } catch (error) {
+        console.error('Törlés log hiba:', error);
+    }
+});
+
+client.on(Events.MessageUpdate, async (oldMessage, newMessage) => {
+    try {
+        if (!newMessage.guild || newMessage.author?.bot) return;
+        if (newMessage.channelId === DEVLOG_CHANNEL_ID) return;
+        if (!oldMessage.content || newMessage.content == null || oldMessage.content === newMessage.content) return;
+
+        await sendDevlog(
+            new EmbedBuilder()
+                .setColor(LOG_COLORS.message)
+                .setTitle('✏️ Üzenet szerkesztve')
+                .addFields(
+                    { name: 'Szerző', value: userLine(newMessage.author?.id), inline: true },
+                    { name: 'Csatorna', value: `<#${newMessage.channelId}>`, inline: true },
+                    { name: 'Előtte', value: shorten(oldMessage.content, 1000) },
+                    { name: 'Utána', value: shorten(newMessage.content, 1000) },
+                    { name: 'Link', value: `[Ugrás az üzenethez](${newMessage.url})` }
+                )
+        );
+    } catch (error) {
+        console.error('Szerkesztés log hiba:', error);
+    }
+});
 
 // ---------- Gombok ----------
 async function handleButton(interaction) {
@@ -724,6 +1227,17 @@ async function handleButton(interaction) {
                 );
 
                 await interaction.editReply({ content: `✅ Kész! ${total} üzenet törölve.` }).catch(() => {});
+
+                await sendDevlog(
+                    new EmbedBuilder()
+                        .setColor(LOG_COLORS.message)
+                        .setTitle('🧹 Csatorna kiürítve (/clear)')
+                        .addFields(
+                            { name: 'Csatorna', value: `<#${channel.id}>`, inline: true },
+                            { name: 'Ki használta', value: userLine(interaction.user.id), inline: true },
+                            { name: 'Törölt üzenetek', value: String(total), inline: true }
+                        )
+                );
             } catch (error) {
                 console.error('Clear hiba:', error);
                 await interaction.editReply({ content: '❌ Hiba történt a törlés közben, nézd meg a bot jogosultságait.' }).catch(() => {});
@@ -1027,6 +1541,10 @@ client.on(Events.InteractionCreate, async interaction => {
                 await interaction.reply({ ...renderMainMenu(), flags: MessageFlags.Ephemeral });
             } else if (interaction.commandName === 'clear') {
                 await handleClearCommand(interaction);
+            } else if (interaction.commandName === 'ban') {
+                await handleBanCommand(interaction);
+            } else if (interaction.commandName === 'kick') {
+                await handleKickCommand(interaction);
             }
         } else if (interaction.isButton()) {
             await handleButton(interaction);
