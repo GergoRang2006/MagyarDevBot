@@ -37,6 +37,9 @@ const VERIFIED_ROLE_ID = process.env.VERIFIED_ROLE_ID || '';
 const VERIFIED_ROLE_NAME = 'verified';
 // Ezt a nevet írja ki a bot a kirúgott/kitiltott tagoknak, ha fellebbezni szeretnének
 const APPEAL_CONTACT = 'Gerytwt';
+// Opcionális: moderátor rang ID-ja. Aki ezt a rangot viseli, a /mod panelen mindent használhat.
+// Ha üres, a Discord jogok döntenek (Ban Members, Kick Members, Moderate Members).
+const MOD_ROLE_ID = process.env.MOD_ROLE_ID || '';
 
 // ---------- Kinézet ----------
 const EMBED_COLOR = 0xFF0000; // az embed bal oldali sávjának színe (piros)
@@ -366,44 +369,8 @@ client.once(Events.ClientReady, async () => {
             .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
             .toJSON(),
         new SlashCommandBuilder()
-            .setName('ban')
-            .setDescription('Tag kitiltása (ideiglenes vagy végleges)')
-            .setDefaultMemberPermissions(PermissionFlagsBits.BanMembers)
-            .addUserOption(o => o.setName('user').setDescription('Kit tiltasz ki?').setRequired(true))
-            .addStringOption(o => o.setName('reason').setDescription('Miért tiltod ki?').setRequired(true).setMaxLength(400))
-            .addStringOption(o => o
-                .setName('type')
-                .setDescription('Ideiglenes vagy végleges tiltás')
-                .setRequired(true)
-                .addChoices(
-                    { name: 'Ideiglenes (temp)', value: 'temp' },
-                    { name: 'Végleges (perma)', value: 'perma' }
-                ))
-            .addIntegerOption(o => o
-                .setName('hours')
-                .setDescription('Hány órára? (csak ideiglenes tiltásnál kell)')
-                .setMinValue(1)
-                .setMaxValue(24 * 365))
-            .toJSON(),
-        new SlashCommandBuilder()
-            .setName('kick')
-            .setDescription('Tag kirúgása a szerverről')
-            .setDefaultMemberPermissions(PermissionFlagsBits.KickMembers)
-            .addUserOption(o => o.setName('user').setDescription('Kit rúgsz ki?').setRequired(true))
-            .addStringOption(o => o.setName('reason').setDescription('Miért rúgod ki?').setRequired(true).setMaxLength(400))
-            .toJSON(),
-        new SlashCommandBuilder()
-            .setName('mute')
-            .setDescription('Tag némítása (nem tud írni, beszélni, reagálni)')
-            .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers)
-            .addUserOption(o => o.setName('user').setDescription('Kit némítasz?').setRequired(true))
-            .addStringOption(o => o.setName('reason').setDescription('Miért némítod?').setRequired(true).setMaxLength(400))
-            .addIntegerOption(o => o
-                .setName('minutes')
-                .setDescription('Hány percre? (max. 40320 = 28 nap)')
-                .setRequired(true)
-                .setMinValue(1)
-                .setMaxValue(28 * 24 * 60))
+            .setName('mod')
+            .setDescription('Moderációs panel (ban, kick, mute, unban, unmute)')
             .toJSON()
     ];
 
@@ -684,31 +651,75 @@ function checkModerable(interaction, target, member) {
     return null;
 }
 
-async function handleBanCommand(interaction) {
-    if (!interaction.inGuild() || !interaction.guild) {
-        await interaction.reply({ content: 'Ez a parancs csak szerveren használható.', flags: MessageFlags.Ephemeral });
-        return;
-    }
-    if (!interaction.memberPermissions?.has(PermissionFlagsBits.BanMembers)) {
-        await interaction.reply({ content: 'Ehhez a parancshoz **Ban Members** jog kell.', flags: MessageFlags.Ephemeral });
-        return;
-    }
+// ---------- Jogosultság: csak a tulaj és a modok ----------
+function isOwner(interaction) {
+    return Boolean(
+        interaction.guild &&
+        (interaction.user.id === interaction.guild.ownerId || (OWNER_ID && interaction.user.id === OWNER_ID))
+    );
+}
 
+// A tulaj mindent tud. A MOD_ROLE_ID rang (ha be van állítva) szintén mindent.
+// Egyébként az adott művelethez tartozó Discord jog kell (Ban Members, Kick Members, Moderate Members).
+function canModerate(interaction, permission) {
+    if (isOwner(interaction)) return true;
+    if (MOD_ROLE_ID && interaction.member?.roles?.cache?.has(MOD_ROLE_ID)) return true;
+    return Boolean(interaction.memberPermissions?.has(permission));
+}
+
+function isModerator(interaction) {
+    return (
+        canModerate(interaction, PermissionFlagsBits.BanMembers) ||
+        canModerate(interaction, PermissionFlagsBits.KickMembers) ||
+        canModerate(interaction, PermissionFlagsBits.ModerateMembers)
+    );
+}
+
+// ---------- Felhasználó keresése (ID, @említés vagy felhasználónév) ----------
+async function resolveTarget(guild, input) {
+    const text = input.trim();
+    const idMatch = text.match(/\d{17,20}/);
+    if (idMatch) return client.users.fetch(idMatch[0]).catch(() => null);
+
+    const query = text.replace(/^@/, '').toLowerCase();
+    if (!query) return null;
+
+    const found = await guild.members.search({ query, limit: 5 }).catch(() => null);
+    if (!found || found.size === 0) return null;
+
+    const exact = found.find(
+        m => m.user.username.toLowerCase() === query || m.displayName.toLowerCase() === query
+    );
+    if (exact) return exact.user;
+    if (found.size === 1) return found.first().user;
+    return null; // több találat, nem tudjuk melyik
+}
+
+// Tiltott felhasználó keresése (ID vagy felhasználónév alapján)
+async function resolveBanned(guild, input) {
+    const text = input.trim();
+    const idMatch = text.match(/\d{17,20}/);
+    if (idMatch) return guild.bans.fetch(idMatch[0]).catch(() => null);
+
+    const query = text.replace(/^@/, '').toLowerCase();
+    if (!query) return null;
+
+    const bans = await guild.bans.fetch().catch(() => null);
+    if (!bans) return null;
+    return (
+        bans.find(
+            b => b.user.username.toLowerCase() === query || b.user.globalName?.toLowerCase() === query
+        ) ?? null
+    );
+}
+
+// ---------- Műveletek (a panel űrlapjai hívják őket; a válasz már "deferred") ----------
+async function doBan(interaction, { target, reason, type, hours }) {
     const guild = interaction.guild;
-    const target = interaction.options.getUser('user', true);
-    const reason = interaction.options.getString('reason', true).trim();
-    const type = interaction.options.getString('type', true); // 'temp' | 'perma'
-    const hours = interaction.options.getInteger('hours');
-
-    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     const fail = text => interaction.editReply({ content: `❌ ${text}` });
 
-    if (type === 'temp' && !hours) {
-        await fail('Ideiglenes tiltásnál add meg, hány órára szól (`hours`).');
-        return;
-    }
-    if (type === 'perma' && hours) {
-        await fail('Végleges tiltásnál ne adj meg órát (`hours`).');
+    if (!canModerate(interaction, PermissionFlagsBits.BanMembers)) {
+        await fail('Ehhez **Ban Members** jog kell.');
         return;
     }
 
@@ -784,22 +795,54 @@ async function handleBanCommand(interaction) {
     await interaction.editReply({ content: `✅ **${target.tag}** kitiltva (${durationText}).${dmNote(dmSent)}` });
 }
 
-async function handleKickCommand(interaction) {
-    if (!interaction.inGuild() || !interaction.guild) {
-        await interaction.reply({ content: 'Ez a parancs csak szerveren használható.', flags: MessageFlags.Ephemeral });
-        return;
-    }
-    if (!interaction.memberPermissions?.has(PermissionFlagsBits.KickMembers)) {
-        await interaction.reply({ content: 'Ehhez a parancshoz **Kick Members** jog kell.', flags: MessageFlags.Ephemeral });
-        return;
-    }
-
+async function doUnban(interaction, { input, reason }) {
     const guild = interaction.guild;
-    const target = interaction.options.getUser('user', true);
-    const reason = interaction.options.getString('reason', true).trim();
-
-    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     const fail = text => interaction.editReply({ content: `❌ ${text}` });
+
+    if (!canModerate(interaction, PermissionFlagsBits.BanMembers)) {
+        await fail('Ehhez **Ban Members** jog kell.');
+        return;
+    }
+
+    const ban = await resolveBanned(guild, input);
+    if (!ban) {
+        await fail('Nem találom a kitiltottak között. Add meg a pontos ID-t vagy felhasználónevet.');
+        return;
+    }
+
+    try {
+        await guild.members.unban(ban.user.id, shorten(`${reason} | Mod: ${interaction.user.tag}`, 500));
+    } catch (error) {
+        console.error('Unban hiba:', error);
+        await fail('Nem sikerült feloldani a tiltást, nézd meg a bot jogosultságait.');
+        return;
+    }
+
+    removeTempBan(guild.id, ban.user.id);
+
+    await sendDevlog(
+        new EmbedBuilder()
+            .setColor(LOG_COLORS.unban)
+            .setTitle('✅ Tiltás feloldva')
+            .setThumbnail(ban.user.displayAvatarURL())
+            .addFields(
+                { name: 'Felhasználó', value: userLine(ban.user.id), inline: true },
+                { name: 'Moderátor', value: userLine(interaction.user.id), inline: true },
+                { name: 'Indok', value: shorten(reason) }
+            )
+    );
+
+    await interaction.editReply({ content: `✅ **${ban.user.tag}** tiltása feloldva.` });
+}
+
+async function doKick(interaction, { target, reason }) {
+    const guild = interaction.guild;
+    const fail = text => interaction.editReply({ content: `❌ ${text}` });
+
+    if (!canModerate(interaction, PermissionFlagsBits.KickMembers)) {
+        await fail('Ehhez **Kick Members** jog kell.');
+        return;
+    }
 
     const member = await guild.members.fetch(target.id).catch(() => null);
     if (!member) {
@@ -854,23 +897,14 @@ async function handleKickCommand(interaction) {
     await interaction.editReply({ content: `✅ **${target.tag}** kirúgva.${dmNote(dmSent)}` });
 }
 
-async function handleMuteCommand(interaction) {
-    if (!interaction.inGuild() || !interaction.guild) {
-        await interaction.reply({ content: 'Ez a parancs csak szerveren használható.', flags: MessageFlags.Ephemeral });
-        return;
-    }
-    if (!interaction.memberPermissions?.has(PermissionFlagsBits.ModerateMembers)) {
-        await interaction.reply({ content: 'Ehhez a parancshoz **Moderate Members** jog kell.', flags: MessageFlags.Ephemeral });
-        return;
-    }
-
+async function doMute(interaction, { target, reason, minutes }) {
     const guild = interaction.guild;
-    const target = interaction.options.getUser('user', true);
-    const reason = interaction.options.getString('reason', true).trim();
-    const minutes = interaction.options.getInteger('minutes', true);
-
-    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     const fail = text => interaction.editReply({ content: `❌ ${text}` });
+
+    if (!canModerate(interaction, PermissionFlagsBits.ModerateMembers)) {
+        await fail('Ehhez **Moderate Members** jog kell.');
+        return;
+    }
 
     const member = await guild.members.fetch(target.id).catch(() => null);
     if (!member) {
@@ -913,6 +947,218 @@ async function handleMuteCommand(interaction) {
     );
 
     await interaction.editReply({ content: `✅ **${target.tag}** némítva (${durationText}).` });
+}
+
+async function doUnmute(interaction, { target, reason }) {
+    const guild = interaction.guild;
+    const fail = text => interaction.editReply({ content: `❌ ${text}` });
+
+    if (!canModerate(interaction, PermissionFlagsBits.ModerateMembers)) {
+        await fail('Ehhez **Moderate Members** jog kell.');
+        return;
+    }
+
+    const member = await guild.members.fetch(target.id).catch(() => null);
+    if (!member) {
+        await fail('Ő nincs a szerveren.');
+        return;
+    }
+    if (!member.isCommunicationDisabled()) {
+        await fail('Ő jelenleg nincs némítva.');
+        return;
+    }
+    if (!member.moderatable) {
+        await fail('A bot nem tudja feloldani a némítást (a botnál magasabb rangú, vagy hiányzik a Moderate Members jog).');
+        return;
+    }
+
+    try {
+        await member.timeout(null, shorten(`${reason} | Mod: ${interaction.user.tag}`, 500));
+    } catch (error) {
+        console.error('Unmute hiba:', error);
+        await fail('Nem sikerült feloldani a némítást, nézd meg a bot jogosultságait.');
+        return;
+    }
+
+    await sendDevlog(
+        new EmbedBuilder()
+            .setColor(LOG_COLORS.unban)
+            .setTitle('🔊 Unmute')
+            .setThumbnail(target.displayAvatarURL())
+            .addFields(
+                { name: 'Felhasználó', value: userLine(target.id), inline: true },
+                { name: 'Moderátor', value: userLine(interaction.user.id), inline: true },
+                { name: 'Indok', value: shorten(reason) }
+            )
+    );
+
+    await interaction.editReply({ content: `✅ **${target.tag}** némítása feloldva.` });
+}
+
+// ---------- A /mod panel ----------
+function renderModPanel() {
+    const embed = new EmbedBuilder()
+        .setColor(EMBED_COLOR)
+        .setTitle('🛡️ Moderációs panel')
+        .setDescription(
+            'Válassz műveletet, és töltsd ki az űrlapot.\n' +
+            'A felhasználót megadhatod **ID-val**, **@említéssel**, vagy (ha a szerveren van) **felhasználónévvel**.\n\n' +
+            'ℹ️ Kirúgást nem lehet visszavonni: a kirúgott tag magától újra csatlakozhat, ezért „unkick” nincs.'
+        );
+
+    const row1 = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('mod:ban_perma').setLabel('Végleges ban').setEmoji('🔨').setStyle(ButtonStyle.Danger),
+        new ButtonBuilder().setCustomId('mod:ban_temp').setLabel('Ideiglenes ban').setEmoji('⏳').setStyle(ButtonStyle.Danger),
+        new ButtonBuilder().setCustomId('mod:kick').setLabel('Kick').setEmoji('👢').setStyle(ButtonStyle.Danger)
+    );
+    const row2 = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('mod:mute').setLabel('Mute').setEmoji('🔇').setStyle(ButtonStyle.Secondary),
+        new ButtonBuilder().setCustomId('mod:unmute').setLabel('Unmute').setEmoji('🔊').setStyle(ButtonStyle.Success),
+        new ButtonBuilder().setCustomId('mod:unban').setLabel('Unban').setEmoji('✅').setStyle(ButtonStyle.Success)
+    );
+
+    return { embeds: [embed], components: [row1, row2] };
+}
+
+function modalRow(id, label, { paragraph = false, required = true, max = 100, placeholder = '' } = {}) {
+    const input = new TextInputBuilder()
+        .setCustomId(id)
+        .setLabel(label)
+        .setStyle(paragraph ? TextInputStyle.Paragraph : TextInputStyle.Short)
+        .setMaxLength(max)
+        .setRequired(required);
+    if (placeholder) input.setPlaceholder(placeholder);
+    return new ActionRowBuilder().addComponents(input);
+}
+
+const MOD_MODALS = {
+    ban_perma: { title: 'Végleges tiltás', reasonRequired: true, extra: [] },
+    ban_temp: {
+        title: 'Ideiglenes tiltás',
+        reasonRequired: true,
+        extra: [modalRow('hours', 'Hány órára?', { max: 5, placeholder: 'pl. 24 (max. 8760)' })]
+    },
+    kick: { title: 'Kirúgás', reasonRequired: true, extra: [] },
+    mute: {
+        title: 'Némítás',
+        reasonRequired: true,
+        extra: [modalRow('minutes', 'Hány percre?', { max: 5, placeholder: 'pl. 60 (max. 40320 = 28 nap)' })]
+    },
+    unmute: { title: 'Némítás feloldása', reasonRequired: false, extra: [] },
+    unban: { title: 'Tiltás feloldása', reasonRequired: false, extra: [] }
+};
+
+function buildModModal(action) {
+    const cfg = MOD_MODALS[action];
+    return new ModalBuilder()
+        .setCustomId(`modm:${action}`)
+        .setTitle(cfg.title)
+        .addComponents(
+            modalRow('target', 'Felhasználó (ID / @ / név)', { placeholder: 'ID, @említés vagy felhasználónév' }),
+            ...cfg.extra,
+            modalRow('reason', cfg.reasonRequired ? 'Indok' : 'Indok (nem kötelező)', {
+                paragraph: true,
+                required: cfg.reasonRequired,
+                max: 400
+            })
+        );
+}
+
+async function handleModCommand(interaction) {
+    if (!interaction.inGuild() || !interaction.guild) {
+        await interaction.reply({ content: 'Ez a parancs csak szerveren használható.', flags: MessageFlags.Ephemeral });
+        return;
+    }
+    if (!isModerator(interaction)) {
+        await interaction.reply({
+            content: 'Ezt a panelt csak a moderátorok és a szerver tulajdonosa használhatja.',
+            flags: MessageFlags.Ephemeral
+        });
+        return;
+    }
+    await interaction.reply({ ...renderModPanel(), flags: MessageFlags.Ephemeral });
+}
+
+async function handleModButton(interaction) {
+    const action = interaction.customId.split(':')[1];
+    if (!MOD_MODALS[action]) return;
+
+    if (!interaction.inGuild() || !isModerator(interaction)) {
+        await interaction.reply({
+            content: 'Ehhez moderátori jog kell.',
+            flags: MessageFlags.Ephemeral
+        });
+        return;
+    }
+    await interaction.showModal(buildModModal(action));
+}
+
+function parseWhole(text, min, max) {
+    const m = String(text).trim().match(/^\d+/);
+    if (!m) return null;
+    const n = Number(m[0]);
+    return n >= min && n <= max ? n : null;
+}
+
+async function handleModModal(interaction) {
+    const action = interaction.customId.split(':')[1];
+    if (!MOD_MODALS[action]) return;
+
+    // Előbb nyugtázzuk az interakciót (a keresés/ban több mint 3 mp-ig is tarthat)
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    const fail = text => interaction.editReply({ content: `❌ ${text}` });
+
+    if (!interaction.inGuild() || !interaction.guild) {
+        await fail('Ez csak szerveren használható.');
+        return;
+    }
+    if (!isModerator(interaction)) {
+        await fail('Ehhez moderátori jog kell.');
+        return;
+    }
+
+    const get = id => {
+        try {
+            return interaction.fields.getTextInputValue(id).trim();
+        } catch {
+            return '';
+        }
+    };
+    const input = get('target');
+    const reason = get('reason') || 'Nincs megadva';
+
+    if (action === 'unban') {
+        await doUnban(interaction, { input, reason });
+        return;
+    }
+
+    const target = await resolveTarget(interaction.guild, input);
+    if (!target) {
+        await fail('Nem találom ezt a felhasználót (vagy több ilyen nevű van). Használd az ID-t vagy az @említést.');
+        return;
+    }
+
+    if (action === 'ban_perma') {
+        await doBan(interaction, { target, reason, type: 'perma', hours: null });
+    } else if (action === 'ban_temp') {
+        const hours = parseWhole(get('hours'), 1, 24 * 365);
+        if (!hours) {
+            await fail('Az órák száma 1 és 8760 közötti egész szám legyen.');
+            return;
+        }
+        await doBan(interaction, { target, reason, type: 'temp', hours });
+    } else if (action === 'kick') {
+        await doKick(interaction, { target, reason });
+    } else if (action === 'mute') {
+        const minutes = parseWhole(get('minutes'), 1, 28 * 24 * 60);
+        if (!minutes) {
+            await fail('A percek száma 1 és 40320 közötti egész szám legyen.');
+            return;
+        }
+        await doMute(interaction, { target, reason, minutes });
+    } else if (action === 'unmute') {
+        await doUnmute(interaction, { target, reason });
+    }
 }
 
 // ---------- Devlog: amit a modok kézzel csinálnak (Discord felületről) ----------
@@ -1654,19 +1900,17 @@ client.on(Events.InteractionCreate, async interaction => {
                 }
             } else if (interaction.commandName === 'clear') {
                 await handleClearCommand(interaction);
-            } else if (interaction.commandName === 'ban') {
-                await handleBanCommand(interaction);
-            } else if (interaction.commandName === 'kick') {
-                await handleKickCommand(interaction);
-            } else if (interaction.commandName === 'mute') {
-                await handleMuteCommand(interaction);
+            } else if (interaction.commandName === 'mod') {
+                await handleModCommand(interaction);
             }
         } else if (interaction.isButton()) {
-            await handleButton(interaction);
+            if (interaction.customId.startsWith('mod:')) await handleModButton(interaction);
+            else await handleButton(interaction);
         } else if (interaction.isStringSelectMenu()) {
             await handleSelect(interaction);
         } else if (interaction.isModalSubmit()) {
-            await handleModal(interaction);
+            if (interaction.customId.startsWith('modm:')) await handleModModal(interaction);
+            else await handleModal(interaction);
         }
     } catch (error) {
         console.error('Interaction hiba:', error);
