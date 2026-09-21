@@ -16,7 +16,8 @@ const {
     StringSelectMenuOptionBuilder,
     PermissionFlagsBits,
     MessageFlags,
-    AuditLogEvent
+    AuditLogEvent,
+    Partials
 } = require('discord.js');
 
 // ---------- Beállítások ----------
@@ -154,8 +155,11 @@ const client = new Client({
         GatewayIntentBits.MessageContent,
         // FIGYELEM: a Server Members Intent-et is be kell kapcsolni a Developer Portalon (belépő/kilépő tagokhoz)
         GatewayIntentBits.GuildMembers,
-        GatewayIntentBits.GuildModeration // audit log események (ban/kick/timeout naplózás)
-    ]
+        GatewayIntentBits.GuildModeration, // audit log események (ban/kick/timeout naplózás)
+        GatewayIntentBits.GuildMessageReactions // /rank reakciók
+    ],
+    // Kell ahhoz, hogy a bot újraindítás után is lássa a régi rangválasztó üzenetekre adott reakciókat
+    partials: [Partials.Message, Partials.Channel, Partials.Reaction]
 });
 
 // Ebben a szobában minden képre kap egy csillag reakciót a bot
@@ -371,6 +375,16 @@ client.once(Events.ClientReady, async () => {
         new SlashCommandBuilder()
             .setName('mod')
             .setDescription('Moderációs panel (ban, kick, mute, unban, unmute)')
+            .toJSON(),
+        new SlashCommandBuilder()
+            .setName('rank')
+            .setDescription('Rangválasztó üzenet küldése (reakcióval kapható rangok)')
+            .setDefaultMemberPermissions(PermissionFlagsBits.ManageRoles)
+            .addStringOption(o => o
+                .setName('text')
+                .setDescription('A kiírandó szöveg (új sor: \\n)')
+                .setRequired(true)
+                .setMaxLength(1500))
             .toJSON()
     ];
 
@@ -1301,7 +1315,7 @@ client.on(Events.GuildMemberRemove, async member => {
 // Csak azokat látja a bot, amik már a memóriájában voltak (újraindítás előtti üzeneteket nem).
 client.on(Events.MessageDelete, async message => {
     try {
-        if (!message.guild || message.author?.bot) return;
+        if (message.partial || !message.guild || message.author?.bot) return;
         if (message.channelId === DEVLOG_CHANNEL_ID || clearing.has(message.channelId)) return;
 
         const embed = new EmbedBuilder()
@@ -1342,6 +1356,126 @@ client.on(Events.MessageUpdate, async (oldMessage, newMessage) => {
     } catch (error) {
         console.error('Szerkesztés log hiba:', error);
     }
+});
+
+// ---------- /rank: rangválasztó reakciókkal ----------
+// Aki rákattint egy reakcióra, megkapja a rangot; aki leveszi a reakciót, elveszti.
+const RANK_ROLES = [
+    { emoji: '💻', name: 'Scripter', roleId: '1551648671848730705' },
+    { emoji: '🧊', name: 'Modeller', roleId: '1551648337382350919' },
+    { emoji: '🧱', name: 'Builder', roleId: '1551649044567302247' },
+    { emoji: '🎬', name: 'Animator', roleId: '1551648186542858391' },
+    { emoji: '🎨', name: 'UI/UX Designer', roleId: '1551648491938521230' }
+];
+
+// A /rank üzenetek ID-i fájlban, hogy újraindítás után is működjenek a reakciók
+const RANKPANEL_FILE = path.join(__dirname, 'rankpanels.json');
+let rankPanels = new Set();
+try {
+    const saved = JSON.parse(fs.readFileSync(RANKPANEL_FILE, 'utf8'));
+    if (Array.isArray(saved)) rankPanels = new Set(saved);
+} catch {
+    rankPanels = new Set();
+}
+
+function saveRankPanels() {
+    try {
+        fs.writeFileSync(RANKPANEL_FILE, JSON.stringify([...rankPanels], null, 2));
+    } catch (error) {
+        console.error('A rankpanels.json nem menthető:', error.message);
+    }
+}
+
+async function handleRankCommand(interaction) {
+    if (!interaction.inGuild() || !interaction.guild) {
+        await interaction.reply({ content: 'Ez a parancs csak szerveren használható.', flags: MessageFlags.Ephemeral });
+        return;
+    }
+    if (!canModerate(interaction, PermissionFlagsBits.ManageRoles)) {
+        await interaction.reply({
+            content: 'Ehhez a parancshoz **Manage Roles** jog kell (vagy a szerver tulajdonosa legyél).',
+            flags: MessageFlags.Ephemeral
+        });
+        return;
+    }
+
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    const guild = interaction.guild;
+
+    // Előre ellenőrizzük, hogy a rangok léteznek és a bot kezelni tudja őket
+    const problems = [];
+    for (const r of RANK_ROLES) {
+        const role = await guild.roles.fetch(r.roleId).catch(() => null);
+        if (!role) problems.push(`**${r.name}**: nem található ilyen rang`);
+        else if (!role.editable) problems.push(`**${r.name}**: a bot rangja nincs a rang fölött (vagy hiányzik a Manage Roles jog)`);
+    }
+    if (problems.length) {
+        await interaction.editReply({ content: `❌ Nem tudom létrehozni, mert:\n${problems.join('\n')}` });
+        return;
+    }
+
+    // A parancsba nem lehet új sort írni, ezért a \n karaktereket új sorra cseréljük
+    const text = interaction.options.getString('text', true).replace(/\\n/g, '\n').trim();
+    const legend = RANK_ROLES.map(r => `${r.emoji} → <@&${r.roleId}>`).join('\n');
+
+    const embed = new EmbedBuilder()
+        .setColor(EMBED_COLOR)
+        .setDescription(`${text}\n\n${legend}`)
+        .setFooter({ text: 'Kattints a reakcióra a rang megszerzéséhez, vedd le a rang elvételéhez.' });
+
+    try {
+        const message = await interaction.channel.send({ embeds: [embed] });
+        rankPanels.add(message.id);
+        saveRankPanels();
+
+        for (const r of RANK_ROLES) {
+            await message.react(r.emoji);
+        }
+    } catch (error) {
+        console.error('Rank üzenet hiba:', error);
+        await interaction.editReply({
+            content: '❌ Nem sikerült elküldeni vagy reagálni. A botnak kell: Send Messages, Embed Links, Add Reactions, Read Message History.'
+        });
+        return;
+    }
+
+    await interaction.editReply({ content: '✅ Kész, a rangválasztó üzenet kint van.' });
+}
+
+async function handleRankReaction(reaction, user, added) {
+    try {
+        if (user.bot) return;
+        if (!rankPanels.has(reaction.message.id)) return;
+
+        if (reaction.partial) await reaction.fetch();
+
+        const rank = RANK_ROLES.find(r => r.emoji === reaction.emoji.name);
+        if (!rank) {
+            // Nem ide tartozó reakció: leszedjük, hogy tiszta maradjon a panel
+            if (added) await reaction.users.remove(user.id).catch(() => {});
+            return;
+        }
+
+        const guildId = reaction.message.guildId;
+        const guild = client.guilds.cache.get(guildId) ?? (await client.guilds.fetch(guildId));
+        const member = await guild.members.fetch(user.id);
+
+        if (added) {
+            await member.roles.add(rank.roleId, 'Rang reakcióval');
+        } else {
+            await member.roles.remove(rank.roleId, 'Rang reakció levéve');
+        }
+    } catch (error) {
+        console.error('Rank reakció hiba:', error.message);
+    }
+}
+
+client.on(Events.MessageReactionAdd, (reaction, user) => handleRankReaction(reaction, user, true));
+client.on(Events.MessageReactionRemove, (reaction, user) => handleRankReaction(reaction, user, false));
+
+// Ha törlik a rangválasztó üzenetet, kivesszük a listából
+client.on(Events.MessageDelete, message => {
+    if (rankPanels.delete(message.id)) saveRankPanels();
 });
 
 // ---------- Gombok ----------
@@ -1902,6 +2036,8 @@ client.on(Events.InteractionCreate, async interaction => {
                 await handleClearCommand(interaction);
             } else if (interaction.commandName === 'mod') {
                 await handleModCommand(interaction);
+            } else if (interaction.commandName === 'rank') {
+                await handleRankCommand(interaction);
             }
         } else if (interaction.isButton()) {
             if (interaction.customId.startsWith('mod:')) await handleModButton(interaction);
